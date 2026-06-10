@@ -233,6 +233,37 @@ def test_searcher_continues_query_expansion_until_max_results(make_paper) -> Non
     assert len(result.papers) == 4
 
 
+def test_searcher_exhausts_dllm_unlearning_synonym_plan_even_after_candidate_budget(make_paper) -> None:
+    calls: list[str] = []
+
+    def fake_search(query: str, **kwargs):
+        calls.append(query)
+        return (
+            make_paper(
+                source_id=query.replace(" ", "-").lower(),
+                title=f"{query} candidate",
+                summary=f"We study {query} with unlearning experiments.",
+            ),
+        )
+
+    agent = SearcherAgent(fake_search, min_results=1)
+    result = agent.run(
+        "dllm unlearning",
+        days=30,
+        max_results=1,
+        max_query_variants=5,
+    )
+
+    assert calls == [
+        "dllm unlearning",
+        "diffusion language model unlearning",
+        "discrete diffusion language model unlearning",
+        "language model unlearning",
+        "LLM unlearning",
+    ]
+    assert len(result.papers) == 5
+
+
 def test_searcher_stops_retrying_rate_limited_source(make_paper) -> None:
     calls: list[tuple[str, str]] = []
 

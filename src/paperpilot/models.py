@@ -103,6 +103,47 @@ class ReflectionResult:
 
 
 @dataclass(frozen=True)
+class SummaryReviewResult:
+    """Reviewer-agent feedback for a generated paper summary."""
+
+    passed: bool
+    grounding_score: float
+    coverage_score: float
+    specificity_score: float
+    presentation_score: float
+    issues: tuple[str, ...] = ()
+    suggestions: tuple[str, ...] = ()
+
+    @property
+    def overall_score(self) -> float:
+        return round(
+            (
+                self.grounding_score
+                + self.coverage_score
+                + self.specificity_score
+                + self.presentation_score
+            )
+            / 4,
+            3,
+        )
+
+    def as_markdown(self) -> str:
+        lines = [
+            (
+                f"- Overall: {self.overall_score:.3f} "
+                f"(grounding {self.grounding_score:.3f}, coverage {self.coverage_score:.3f}, "
+                f"specificity {self.specificity_score:.3f}, presentation {self.presentation_score:.3f})"
+            ),
+            f"- Status: {'passed' if self.passed else 'needs revision'}",
+        ]
+        if self.issues:
+            lines.append("- Issues: " + "; ".join(self.issues))
+        if self.suggestions:
+            lines.append("- Suggestions: " + "; ".join(self.suggestions))
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class PaperSummary:
     """Korean five-part paper summary."""
 
@@ -114,6 +155,7 @@ class PaperSummary:
     reflection: ReflectionResult = field(
         default_factory=lambda: ReflectionResult(passed=True)
     )
+    review: SummaryReviewResult | None = None
 
     def as_markdown(self) -> str:
         sections = [
@@ -123,6 +165,8 @@ class PaperSummary:
             ("4. 실험/결과", self.experiments),
             ("5. 한계와 확인 필요", self.limitations),
         ]
+        if self.review is not None:
+            sections.append(("6. Summary Reviewer", self.review.as_markdown()))
         return "\n".join(f"### {title}\n\n{body}" for title, body in sections)
 
 
@@ -170,6 +214,7 @@ class CurationReport:
     selected: tuple[SelectedPaper, ...]
     trace: tuple[TraceEvent, ...] = ()
     output_path: Path | None = None
+    log_output_path: Path | None = None
     min_relevance: float | None = None
     categories: tuple[str, ...] = ()
     strict_search: bool | None = None

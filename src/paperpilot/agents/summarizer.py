@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from paperpilot.models import Paper, PaperEvidence, PaperSummary, ReflectionResult, ReviewScore
+from paperpilot.models import Paper, PaperEvidence, PaperSummary, ReflectionResult, ReviewScore, SummaryReviewResult
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
@@ -42,6 +43,48 @@ FACTCHAT_MODEL_PREFERENCES = (
     "accounts/fireworks/models/llama4-scout-instruct-basic",
 )
 SUMMARY_DETAIL_LEVELS = {"standard", "deep", "ultra"}
+
+
+SUMMARY_REVIEWER_PROMPT = """\
+You are SummaryReviewerAgent, a strict research-report reviewer.
+
+Goal:
+Review a Korean five-part paper summary before it is published in PaperPilot.
+Do not rewrite the whole summary. Diagnose what should be fixed so the
+SummarizerAgent can revise it in a second pass.
+
+Inputs:
+1. paper metadata
+2. reviewer relevance/novelty/experiment score
+3. bounded evidence snippets from abstract/PDF
+4. draft Korean summary
+
+Review dimensions:
+- grounding: every strong claim must be supported by the provided evidence.
+- coverage: the summary must cover problem, novelty/contribution, method,
+  experiments/results, and limitations/check-needed items.
+- specificity: prefer concrete mechanisms, datasets, metrics, baselines, and
+  failure cases over generic praise.
+- presentation_readiness: the text should be usable in a slide/report without
+  implementation jargon such as "JSON", "backend", or "prompt".
+
+Return JSON only:
+{
+  "grounding_score": 0.0-1.0,
+  "coverage_score": 0.0-1.0,
+  "specificity_score": 0.0-1.0,
+  "presentation_score": 0.0-1.0,
+  "passed": true/false,
+  "issues": ["short issue labels"],
+  "suggestions": ["specific revision instructions"]
+}
+
+Rules:
+- Penalize unsupported numbers or comparisons.
+- Penalize missing caveats when evidence is abstract-only or partial PDF text.
+- Reward explicit "확인 필요" language when the evidence is incomplete.
+- Keep feedback short enough to fit into the final report.
+"""
 
 
 class SummaryBackendError(RuntimeError):
@@ -315,11 +358,132 @@ class OpenAISummaryBackend:
         return data
 
 
+class SummaryReviewerAgent:
+    """Review generated summaries before publication.
+
+    The current implementation is deterministic and cost-free, but the prompt
+    is intentionally exposed so the same agent can be upgraded to an LLM
+    reviewer/reviser without changing the workflow shape.
+    """
+
+    def __init__(self, *, prompt: str = SUMMARY_REVIEWER_PROMPT, pass_threshold: float = 0.72) -> None:
+        self.prompt = prompt
+        self.pass_threshold = pass_threshold
+
+    def build_prompt(
+        self,
+        paper: Paper,
+        score: ReviewScore,
+        summary: PaperSummary,
+        *,
+        evidence: PaperEvidence | None = None,
+    ) -> str:
+        payload = {
+            "paper": {
+                "title": paper.title,
+                "authors": list(paper.authors),
+                "abstract": paper.summary,
+                "published": paper.published.date().isoformat(),
+                "source": paper.source,
+                "url": paper.url,
+            },
+            "review_score": {
+                "relevance": score.relevance,
+                "novelty": score.novelty,
+                "experimental_strength": score.experimental_strength,
+                "total": score.total,
+                "reason": score.reason,
+            },
+            "evidence_scope": _summary_review_evidence_scope(evidence),
+            "draft_summary": _summary_review_text(summary),
+        }
+        return f"{self.prompt}\n\nINPUT_JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+
+    def review(
+        self,
+        paper: Paper,
+        score: ReviewScore,
+        summary: PaperSummary,
+        *,
+        evidence: PaperEvidence | None = None,
+    ) -> SummaryReviewResult:
+        text = _summary_review_text(summary)
+        reflection = validate_summary(summary)
+        issues = list(reflection.issues)
+        suggestions: list[str] = []
+
+        grounding_score = 0.9 if evidence and evidence.available else 0.72
+        if "주요 근거" not in text and "근거" not in text:
+            grounding_score -= 0.18
+            issues.append("weak evidence grounding")
+            suggestions.append("각 섹션에 PDF/초록 근거 범위를 명시한다.")
+        unsupported_numbers = _unsupported_summary_numbers(summary, paper, evidence)
+        if unsupported_numbers:
+            grounding_score -= 0.2
+            issues.append("unsupported quantitative claim")
+            suggestions.append(f"근거에서 확인되지 않은 수치 {', '.join(unsupported_numbers[:3])}는 확인 필요로 표시한다.")
+
+        coverage_score = max(0.0, 1.0 - 0.16 * len(reflection.issues))
+        if reflection.issues:
+            suggestions.append("누락된 5-part summary 항목을 보강한다.")
+
+        specificity_score = 0.72
+        if _has_quantitative_evidence(text):
+            specificity_score += 0.1
+        if any(token in text for token in ("데이터셋", "benchmark", "벤치마크", "ablation", "실패", "비교")):
+            specificity_score += 0.1
+        if any(token in text for token in ("새로움/차별점", "주요 기여", "방법:", "실험/결과")):
+            specificity_score += 0.08
+        if _looks_generic_summary(text):
+            specificity_score -= 0.18
+            issues.append("generic summary")
+            suggestions.append("구체적인 메커니즘, 데이터셋, 비교 기준, 실패 조건을 우선 적는다.")
+
+        presentation_score = 0.92
+        forbidden_terms = ("JSON", "backend", "prompt", "schema", "API response")
+        leaked_terms = [term for term in forbidden_terms if term.lower() in text.lower()]
+        if leaked_terms:
+            presentation_score -= 0.22
+            issues.append("implementation jargon leaked")
+            suggestions.append(f"발표용 보고서에서 구현 표현을 제거한다: {', '.join(leaked_terms)}.")
+        if len(text) < 400:
+            presentation_score -= 0.12
+            issues.append("too short for report")
+            suggestions.append("발표자가 읽을 수 있도록 문제-기여-방법-실험-한계 설명을 한두 문장씩 보강한다.")
+
+        scores = (
+            _clamp_score(grounding_score),
+            _clamp_score(coverage_score),
+            _clamp_score(specificity_score),
+            _clamp_score(presentation_score),
+        )
+        passed = min(scores) >= self.pass_threshold and not reflection.issues
+        if not suggestions and passed:
+            suggestions.append("요약은 report에 게시 가능한 수준이며, 발표에서는 contribution과 limitation을 먼저 보여준다.")
+        return SummaryReviewResult(
+            passed=passed,
+            grounding_score=scores[0],
+            coverage_score=scores[1],
+            specificity_score=scores[2],
+            presentation_score=scores[3],
+            issues=tuple(dict.fromkeys(issues)),
+            suggestions=tuple(dict.fromkeys(suggestions)),
+        )
+
+
 class SummarizerAgent:
     """Write Korean summaries from paper metadata using a configurable backend."""
 
-    def __init__(self, backend: SummaryBackend | None = None) -> None:
+    def __init__(
+        self,
+        backend: SummaryBackend | None = None,
+        *,
+        summary_reviewer: SummaryReviewerAgent | None = None,
+        review_summaries: bool = True,
+    ) -> None:
         self.backend = backend or HeuristicSummaryBackend()
+        self.summary_reviewer = summary_reviewer or SummaryReviewerAgent()
+        self.review_summaries = review_summaries
         self.fallback_reasons: list[str] = []
 
     @property
@@ -345,6 +509,9 @@ class SummarizerAgent:
         fallback_reason = getattr(self.backend, "fallback_reason", None)
         if fallback_reason:
             self.fallback_reasons.append(fallback_reason)
+        if self.review_summaries:
+            review = self.summary_reviewer.review(paper, score, summary, evidence=evidence)
+            summary = replace(summary, review=review)
         return summary
 
 
@@ -879,6 +1046,63 @@ def _polish_report_language(text: str) -> str:
         polished = polished.replace(source, target)
     polished = re.sub(r"\s+", " ", polished).strip()
     return polished
+
+
+def _summary_review_text(summary: PaperSummary) -> str:
+    return "\n\n".join(
+        (
+            summary.problem,
+            summary.contribution,
+            summary.method,
+            summary.experiments,
+            summary.limitations,
+        )
+    )
+
+
+def _summary_review_evidence_scope(evidence: PaperEvidence | None) -> str:
+    if evidence is None:
+        return "abstract only"
+    if evidence.available:
+        total = f"/{evidence.total_pages}" if evidence.total_pages is not None else ""
+        return f"PDF text, pages {evidence.pages_read}{total}"
+    return f"abstract fallback: {evidence.error or 'PDF evidence unavailable'}"
+
+
+def _unsupported_summary_numbers(
+    summary: PaperSummary,
+    paper: Paper,
+    evidence: PaperEvidence | None,
+) -> list[str]:
+    evidence_text = " ".join(
+        value
+        for value in (
+            paper.summary,
+            evidence.text if evidence and evidence.available else "",
+        )
+        if value
+    )
+    allowed = set(_quantitative_snippets(evidence_text))
+    unsupported: list[str] = []
+    for number in _quantitative_snippets(_summary_review_text(summary)):
+        if number not in allowed and "확인 필요" not in _summary_review_text(summary):
+            unsupported.append(number)
+    return sorted(set(unsupported))
+
+
+def _looks_generic_summary(text: str) -> bool:
+    generic_markers = (
+        "중요한 연구입니다",
+        "좋은 성능을 보입니다",
+        "다양한 실험",
+        "새로운 방법을 제안합니다",
+        "향상시킵니다",
+    )
+    return any(marker in text for marker in generic_markers) and not _has_quantitative_evidence(text)
+
+
+def _clamp_score(value: float) -> float:
+    return round(min(1.0, max(0.0, value)), 3)
 
 
 def validate_summary(summary: PaperSummary) -> ReflectionResult:

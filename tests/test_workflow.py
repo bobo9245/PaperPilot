@@ -61,8 +61,11 @@ def test_workflow_fetches_pdf_evidence_for_selected_papers(make_paper, tmp_path)
     assert any(event.step == "review" for event in report.trace)
     content = report.output_path.read_text(encoding="utf-8")
     assert "- PDF evidence: Enabled, max pages 2, max chars 32000" in content
-    assert "## Agent Trace" in content
-    assert "| review | Score relevance, novelty, and experimental strength |" in content
+    assert "## Agent Trace" not in content
+    assert report.log_output_path is not None
+    log_content = report.log_output_path.read_text(encoding="utf-8")
+    assert "## Agent Trace" in log_content
+    assert "| review | Score relevance, novelty, and experimental strength |" in log_content
 
 
 def test_workflow_records_auto_summary_fallback(make_paper, tmp_path, monkeypatch) -> None:
@@ -145,8 +148,10 @@ def test_workflow_combines_multisource_search_results(make_paper, tmp_path) -> N
     assert paper.venue == "ICLR"
     assert report.deduped_count == 1
     assert [attempt.source for attempt in report.attempts] == ["arxiv", "openalex"]
+    assert report.log_output_path is not None
+    log_content = report.log_output_path.read_text(encoding="utf-8")
+    assert "| arxiv | multimodal retrieval augmented generation | success | 1 |" in log_content
     content = report.output_path.read_text(encoding="utf-8")
-    assert "| arxiv | multimodal retrieval augmented generation | success | 1 |" in content
     assert "- Google Scholar: https://scholar.google.com/scholar?q=Shared+Multimodal+RAG+Paper" in content
 
 

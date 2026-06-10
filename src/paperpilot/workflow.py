@@ -191,6 +191,7 @@ class CurationWorkflow:
             summary_fallback_reason=fallback_reason,
         )
         output_path = self.publisher.publish(report)
+        log_output_path = self.publisher.last_log_path
         return CurationReport(
             query=report.query,
             generated_at=report.generated_at,
@@ -198,6 +199,7 @@ class CurationWorkflow:
             selected=report.selected,
             trace=report.trace,
             output_path=output_path,
+            log_output_path=log_output_path,
             min_relevance=report.min_relevance,
             categories=report.categories,
             strict_search=report.strict_search,

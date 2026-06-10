@@ -77,11 +77,11 @@ def test_markdown_publisher_writes_report(tmp_path, make_paper) -> None:
     )
 
     path = MarkdownPublisher(tmp_path).publish(report)
+    log_path = tmp_path / "2026-01-10_retrieval-augmented-generation_log.md"
 
     assert path.name == "2026-01-10_retrieval-augmented-generation.md"
+    assert log_path.exists()
     content = path.read_text(encoding="utf-8")
-    assert "## Search Attempts" in content
-    assert "| Source | Query | Status | Results | Note |" in content
     assert "- Min relevance: 0.800" in content
     assert "- Categories: cs.CL" in content
     assert "- Search mode: strict title/abstract" in content
@@ -95,10 +95,9 @@ def test_markdown_publisher_writes_report(tmp_path, make_paper) -> None:
     assert "- Evidence: abstract only" in content
     assert "## Presentation Highlights" in content
     assert "Agent loop evidence" in content
-    assert "Demo path: Search Attempts -> Agent Trace" in content
     assert "## Project Alignment" in content
-    assert "## Agent Trace" in content
-    assert "| review | Score relevance, novelty, and experimental strength |" in content
+    assert "## Search Attempts" not in content
+    assert "## Agent Trace" not in content
     assert "- Source: arxiv, openalex" in content
     assert "- DOI: 10.1234/test" in content
     assert "- Venue: ACL" in content
@@ -106,3 +105,10 @@ def test_markdown_publisher_writes_report(tmp_path, make_paper) -> None:
     assert "- Google Scholar: https://scholar.google.com/scholar?q=Adaptive+Retrieval+Augmented+Generation" in content
     assert "Reviewer score: 0.850" in content
     assert "핵심 기여" in content
+
+    log_content = log_path.read_text(encoding="utf-8")
+    assert "# PaperPilot Run Log: retrieval augmented generation" in log_content
+    assert "## Search Attempts" in log_content
+    assert "| Source | Query | Status | Results | Note |" in log_content
+    assert "## Agent Trace" in log_content
+    assert "| review | Score relevance, novelty, and experimental strength |" in log_content

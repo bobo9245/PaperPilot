@@ -15,11 +15,15 @@ class MarkdownPublisher:
 
     def __init__(self, output_dir: str | Path = "outputs") -> None:
         self.output_dir = Path(output_dir)
+        self.last_log_path: Path | None = None
 
     def publish(self, report: CurationReport) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         path = self.output_dir / _report_filename(report.query, report.generated_at.date())
+        log_path = self.output_dir / _log_filename(report.query, report.generated_at.date())
         path.write_text(render_markdown(report), encoding="utf-8")
+        log_path.write_text(render_log_markdown(report), encoding="utf-8")
+        self.last_log_path = log_path
         return path
 
 
@@ -48,38 +52,7 @@ def render_markdown(report: CurationReport) -> str:
         "- User: 최신 연구 동향을 빠르게 따라가야 하는 대학원생과 연구자.",
         "- Context: 검색어가 좁으면 후보를 놓치고, 검색어가 넓으면 약한 후보가 섞이는 논문 탐색 상황.",
         "- Agentic Fit: PaperPilot은 query planning, multi-source tool use, observation, replanning, review, PDF evidence extraction, reflection/fallback을 연결해 반복 가능한 큐레이션 workflow를 만듭니다.",
-        "",
-        "## Search Attempts",
-        "",
-        "| Source | Query | Status | Results | Note |",
-        "| --- | --- | --- | ---: | --- |",
     ]
-
-    for attempt in report.attempts:
-        lines.append(
-            f"| {_escape(attempt.source)} | {_escape(attempt.query)} | {attempt.status} | "
-            f"{attempt.results_count} | {_escape(attempt.message)} |"
-        )
-
-    lines.extend(["", "## Agent Trace", ""])
-    if report.trace:
-        for phase, events in _group_trace_by_phase(report.trace):
-            lines.extend(
-                [
-                    f"### {phase}",
-                    "",
-                    "| Step | Action | Input | Observation | Decision | Status |",
-                    "| --- | --- | --- | --- | --- | --- |",
-                ]
-            )
-            for event in events:
-                lines.append(
-                    f"| {_escape(event.step)} | {_escape(event.action)} | {_escape(event.input)} | "
-                    f"{_escape(event.observation)} | {_escape(event.decision)} | {_escape(event.status)} |"
-                )
-            lines.append("")
-    else:
-        lines.append("No trace events were recorded.")
 
     lines.extend(["", "## Selected Papers", ""])
 
@@ -123,8 +96,66 @@ def render_markdown(report: CurationReport) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_log_markdown(report: CurationReport) -> str:
+    lines = [
+        f"# PaperPilot Run Log: {report.query}",
+        "",
+        f"- Generated: {report.generated_at.isoformat()}",
+        f"- Selected papers: {len(report.selected)}",
+        f"- Min relevance: {_format_min_relevance(report.min_relevance)}",
+        f"- Categories: {', '.join(report.categories) if report.categories else 'Any'}",
+        f"- Search mode: {_format_search_mode(report.strict_search)}",
+        f"- Agentic mode: {report.agentic_mode}, max steps {report.max_agent_steps}",
+        f"- Unique candidates: {report.candidate_count}",
+        f"- Duplicates merged: {report.deduped_count}",
+        f"- PDF evidence: {_format_pdf_mode(report.with_pdf, report.pdf_max_pages, report.pdf_max_chars)}",
+        f"- Summary backend: {_format_summary_backend(report)}",
+        "",
+        "## Search Attempts",
+        "",
+        "| Source | Query | Status | Results | Note |",
+        "| --- | --- | --- | ---: | --- |",
+    ]
+
+    for attempt in report.attempts:
+        lines.append(
+            f"| {_escape(attempt.source)} | {_escape(attempt.query)} | {attempt.status} | "
+            f"{attempt.results_count} | {_escape(attempt.message)} |"
+        )
+
+    lines.extend(["", "## Agent Trace", ""])
+    if report.trace:
+        for phase, events in _group_trace_by_phase(report.trace):
+            lines.extend(
+                [
+                    f"### {phase}",
+                    "",
+                    "| Step | Action | Input | Observation | Decision | Status |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+            for event in events:
+                lines.append(
+                    f"| {_escape(event.step)} | {_escape(event.action)} | {_escape(event.input)} | "
+                    f"{_escape(event.observation)} | {_escape(event.decision)} | {_escape(event.status)} |"
+                )
+            lines.append("")
+    else:
+        lines.append("No trace events were recorded.")
+
+    if report.failure_analysis and not report.selected:
+        lines.extend(["", "## Failure Analysis", ""])
+        lines.extend(_failure_analysis_lines(report))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _report_filename(query: str, generated_date: date) -> str:
     return f"{generated_date.isoformat()}_{_slugify(query)}.md"
+
+
+def _log_filename(query: str, generated_date: date) -> str:
+    return f"{generated_date.isoformat()}_{_slugify(query)}_log.md"
 
 
 def _slugify(value: str) -> str:
@@ -211,14 +242,14 @@ def _presentation_highlights(report: CurationReport) -> list[str]:
                     f"PDF evidence {pdf_successes}/{len(report.selected)}, "
                     f"summary reflection {reflection_passes}/{len(report.selected)} passed."
                 ),
-                f"- Demo path: Search Attempts -> Agent Trace -> `{_trim_for_highlight(first_title)}` 요약 순서로 보여주면 됩니다.",
+                f"- Demo path: 결과 보고서의 `{_trim_for_highlight(first_title)}` 요약과 별도 log 파일의 Search Attempts/Agent Trace를 함께 보여주면 됩니다.",
             ]
         )
     else:
         lines.extend(
             [
                 "- Grounded output: 선택된 논문이 없어도 약한 후보를 억지로 채우지 않고 실패 분석을 남깁니다.",
-                "- Demo path: Search Attempts -> Agent Trace -> Failure Analysis 순서로 실패 회복/한계를 설명하면 됩니다.",
+                "- Demo path: 별도 log 파일의 Search Attempts/Agent Trace와 결과 보고서의 Failure Analysis를 함께 보여주면 됩니다.",
             ]
         )
     return lines

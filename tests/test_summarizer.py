@@ -6,6 +6,8 @@ from paperpilot.agents.summarizer import (
     AutoSummaryBackend,
     FactChatSummaryBackend,
     OpenAISummaryBackend,
+    SUMMARY_REVIEWER_PROMPT,
+    SummaryReviewerAgent,
     SummarizerAgent,
     build_evidence_pack,
     build_summary_backend,
@@ -23,6 +25,21 @@ def _score() -> ReviewScore:
         total=0.9,
         reason="test",
     )
+
+
+def test_summarizer_attaches_summary_reviewer_feedback(make_paper) -> None:
+    paper = make_paper(summary="We propose a retrieval augmented generation model with evaluation on 6 datasets.")
+    score = _score()
+
+    summary = SummarizerAgent().summarize(paper, score)
+
+    assert summary.review is not None
+    assert summary.review.overall_score > 0
+    assert "### 6. Summary Reviewer" in summary.as_markdown()
+    prompt = SummaryReviewerAgent().build_prompt(paper, score, summary)
+    assert SUMMARY_REVIEWER_PROMPT in prompt
+    assert "draft_summary" in prompt
+    assert "grounding_score" in prompt
 
 
 class FakeOpenAIResponse:

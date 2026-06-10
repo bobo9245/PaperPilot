@@ -66,6 +66,7 @@ class SearcherAgent:
         broad_search_used = False
         broad_search_requested = False
         query_plan = planner.plan(query)
+        exhaust_query_plan = _should_exhaust_query_plan(query, query_expansion)
 
         for candidate_index, candidate in enumerate(query_plan):
             for source_index, source in enumerate(sources):
@@ -186,7 +187,7 @@ class SearcherAgent:
 
             if query_expansion == "off" and len(papers_by_key) >= self.min_results:
                 break
-            if len(papers_by_key) >= max_results:
+            if not exhaust_query_plan and len(papers_by_key) >= max_results:
                 break
 
         if (
@@ -242,7 +243,7 @@ class SearcherAgent:
 
         return SearchResult(
             original_query=query,
-            papers=tuple(papers_by_key.values())[:max_results],
+            papers=tuple(papers_by_key.values()) if exhaust_query_plan else tuple(papers_by_key.values())[:max_results],
             attempts=tuple(attempts),
             raw_results_count=raw_results_count,
             deduped_count=max(0, raw_results_count - len(papers_by_key)),
@@ -490,6 +491,25 @@ def _has_more_plan(
     source_index: int,
 ) -> bool:
     return candidate_index < len(query_plan) - 1 or source_index < len(sources) - 1
+
+
+def _should_exhaust_query_plan(query: str, query_expansion: str) -> bool:
+    """Run every planned synonym variant for narrow DLM-unlearning searches."""
+
+    if query_expansion == "off":
+        return False
+    normalized = " ".join(re.findall(r"[a-z0-9]+", query.lower()))
+    has_unlearning = "unlearning" in normalized
+    has_dlm = any(
+        signal in normalized
+        for signal in (
+            "dllm",
+            "dlm",
+            "diffusion language model",
+            "discrete diffusion language model",
+        )
+    )
+    return has_unlearning and has_dlm
 
 
 def _record_policy_trace(

@@ -357,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
     except SummaryBackendError as exc:
         parser.exit(1, f"error: {exc}\n")
     print(f"Saved curation report: {report.output_path}")
+    if report.log_output_path:
+        print(f"Saved curation log: {report.log_output_path}")
     print(f"Selected papers: {len(report.selected)}")
     return 0
 
