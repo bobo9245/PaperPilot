@@ -53,22 +53,78 @@ def _paper_text(paper: Paper) -> str:
 
 
 def _score_relevance(text: str, query: str) -> float:
-    query_terms = [
+    concepts = _query_concepts(query)
+    if not concepts:
+        return 0.5
+
+    normalized_text = " ".join(re.findall(r"[a-z0-9]+", text))
+    text_terms = set(re.findall(r"[a-z0-9]+", text))
+    hits = sum(1 for concept in concepts if _concept_matches(concept, normalized_text, text_terms))
+    base_score = hits / len(concepts)
+
+    phrase = " ".join(_query_terms(query))
+    phrase_bonus = 0.15 if len(concepts) > 1 and phrase in normalized_text else 0.0
+    return round(min(1.0, base_score + phrase_bonus), 3)
+
+
+def _query_concepts(query: str) -> tuple[tuple[str, ...], ...]:
+    normalized = " ".join(re.findall(r"[a-z0-9]+", query.lower()))
+    concepts: list[tuple[str, ...]] = []
+    consumed: set[str] = set()
+
+    phrase_concepts = (
+        (
+            ("retrieval augmented generation", "rag"),
+            ("retrieval", "augmented", "generation"),
+        ),
+        (
+            (
+                "diffusion language model",
+                "discrete diffusion language model",
+                "large language model",
+                "language model",
+                "dlm",
+                "dllm",
+                "llm",
+            ),
+            ("diffusion", "language", "model"),
+        ),
+        (
+            ("multimodal", "multi modal", "multi-modal", "vision language", "vision-language"),
+            ("multimodal",),
+        ),
+    )
+    for alternatives, terms in phrase_concepts:
+        if any(_normalized_phrase(alternative) in normalized for alternative in alternatives):
+            concepts.append(tuple(_normalized_phrase(alternative) for alternative in alternatives))
+            consumed.update(terms)
+
+    for term in _query_terms(query):
+        if term not in consumed:
+            concepts.append((term,))
+    return tuple(concepts)
+
+
+def _concept_matches(concept: tuple[str, ...], normalized_text: str, text_terms: set[str]) -> bool:
+    for alternative in concept:
+        if " " in alternative:
+            if alternative in normalized_text:
+                return True
+        elif alternative in text_terms:
+            return True
+    return False
+
+
+def _query_terms(query: str) -> list[str]:
+    return [
         term
         for term in re.findall(r"[a-z0-9]+", query.lower())
         if len(term) > 2 and term not in _STOPWORDS
     ]
-    if not query_terms:
-        return 0.5
 
-    text_terms = set(re.findall(r"[a-z0-9]+", text))
-    hits = sum(1 for term in query_terms if term in text_terms)
-    base_score = hits / len(query_terms)
 
-    normalized_text = " ".join(re.findall(r"[a-z0-9]+", text))
-    phrase = " ".join(query_terms)
-    phrase_bonus = 0.15 if len(query_terms) > 1 and phrase in normalized_text else 0.0
-    return round(min(1.0, base_score + phrase_bonus), 3)
+def _normalized_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
 
 
 def _score_novelty(text: str, paper: Paper, *, now: datetime | None) -> float:

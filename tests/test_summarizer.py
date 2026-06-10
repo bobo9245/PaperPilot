@@ -8,6 +8,7 @@ from paperpilot.agents.summarizer import (
     OpenAISummaryBackend,
     SummarizerAgent,
     build_evidence_pack,
+    build_summary_backend,
     rewrite_for_reflection,
     validate_summary,
 )
@@ -332,6 +333,71 @@ def test_summarizer_formats_benchmark_reports_differently(make_paper) -> None:
     assert "벤치마크/결과" in summary.experiments
 
 
+def test_summarizer_avoids_rag_template_for_unlearning_benchmarks(make_paper) -> None:
+    paper = make_paper(
+        title="REMEDI: A Benchmark for Retention and Unlearning Evaluation",
+        summary=(
+            "Language models trained for clinical disease inference may include sensitive patient data. "
+            "However, exactly unlearning patient-specific data is intractable. "
+            "We introduce a structured benchmark for machine unlearning methods."
+        ),
+    )
+    evidence = PaperEvidence(
+        source="pdf",
+        text=(
+            "However, exactly unlearning patient-specific data is intractable. "
+            "We introduce a structured and comprehensive benchmark called REMEDI. "
+            "The evaluation framework measures utility and privacy. "
+            "We evaluate four machine unlearning methods across three severity levels."
+        ),
+        sections=(
+            PaperEvidenceSection(
+                label="introduction",
+                heading="Introduction",
+                text="However, exactly unlearning patient-specific data is intractable.",
+            ),
+            PaperEvidenceSection(
+                label="benchmark",
+                heading="Benchmark",
+                text=(
+                    "We introduce a structured and comprehensive benchmark called REMEDI. "
+                    "The evaluation framework measures utility and privacy."
+                ),
+            ),
+            PaperEvidenceSection(
+                label="experiments",
+                heading="Experiments",
+                text="We evaluate four machine unlearning methods across three severity levels.",
+            ),
+        ),
+        pages_read=7,
+        total_pages=7,
+    )
+    score = ReviewScore(
+        relevance=1.0,
+        novelty=0.8,
+        experimental_strength=0.9,
+        total=0.9,
+        reason="test",
+    )
+
+    summary = SummarizerAgent().summarize(paper, score, evidence=evidence)
+    full_text = " ".join(
+        [
+            summary.problem,
+            summary.contribution,
+            summary.method,
+            summary.experiments,
+            summary.limitations,
+        ]
+    )
+
+    assert "모델 언러닝" in summary.problem
+    assert "기존 RAG/검색 방식" not in full_text
+    assert "멀티모달 문서 검색/RAG" not in full_text
+    assert "레이아웃" not in summary.problem
+
+
 def test_summarizer_keeps_system_papers_as_research_even_with_benchmarks(make_paper) -> None:
     paper = make_paper(
         title="MM-BizRAG: Rethinking Multimodal Retrieval-Augmented Generation",
@@ -585,7 +651,7 @@ def test_factchat_backend_uses_gateway_chat_schema(make_paper) -> None:
     assert "한국어 연구 논문 큐레이터" in call["messages"][0]["content"]
     assert "논문의 새로움" in call["messages"][0]["content"]
     assert "기존 방식 대비" in call["messages"][0]["content"]
-    assert "FactChat 요약 backend" in summary.contribution
+    assert "FactChat 요약 backend" not in summary.contribution
     assert "새로움/차별점" in summary.contribution
     assert "32%" in summary.experiments
     assert summary.reflection.passed
@@ -601,7 +667,32 @@ def test_factchat_backend_auto_selects_available_model(make_paper) -> None:
     call = client.chat.completions.calls[0]
     assert call["model"] == "gemini-2.5-flash"
     assert backend.model == "gemini-2.5-flash"
-    assert "FactChat 요약 backend" in summary.contribution
+    assert "새로움/차별점" in summary.contribution
+
+
+def test_factchat_backend_cheap_selects_low_cost_model(make_paper) -> None:
+    paper = make_paper(summary="This paper studies retrieval augmented generation.")
+    client = FakeFactChatClient(
+        model_ids=(
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gemini-3.1-flash-lite",
+        )
+    )
+    backend = FactChatSummaryBackend(model="cheap", detail="standard", client=client)
+
+    summary = backend.summarize(paper, _score())
+
+    call = client.chat.completions.calls[0]
+    assert call["model"] == "gpt-5.4-nano"
+    assert backend.model == "gpt-5.4-nano"
+    assert "새로움/차별점" in summary.contribution
+
+
+def test_factchat_backend_default_model_is_cheap() -> None:
+    backend = build_summary_backend("factchat")
+
+    assert backend.model == "cheap"
 
 
 def test_ultra_detail_adds_novelty_focused_evidence(make_paper) -> None:
@@ -704,7 +795,30 @@ def test_auto_backend_prefers_factchat_when_key_exists(make_paper, monkeypatch) 
 
     assert backend.model == "gemini-2.5-flash"
     assert backend.fallback_reason is None
-    assert "FactChat 요약 backend" in summary.contribution
+    assert "새로움/차별점" in summary.contribution
+
+
+def test_llm_summary_polishes_report_language(make_paper) -> None:
+    paper = make_paper(summary="This paper studies retrieval augmented generation.")
+    client = FakeOpenAIClient(
+        data=_llm_summary_data(
+            novelty=[
+                "document structure-aware split는 evidence 범위에서 확인된다.",
+            ],
+            limitations=[
+                "JSON 범위 내에서 baseline 상세는 확인 불가다.",
+            ],
+        )
+    )
+    backend = OpenAISummaryBackend(model="custom-summary-model", client=client)
+
+    summary = backend.summarize(paper, _score())
+
+    assert "문서 구조 인식 분할" in summary.contribution
+    assert "제공된 근거 범위" in summary.contribution
+    assert "비교 기준" in summary.limitations
+    assert "JSON 범위" not in summary.limitations
+    assert "evidence" not in summary.contribution
 
 
 def test_openai_backend_marks_unsupported_numeric_claims(make_paper) -> None:

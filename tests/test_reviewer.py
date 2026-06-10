@@ -44,3 +44,27 @@ def test_reviewer_filters_below_min_relevance(make_paper) -> None:
     )
 
     assert [item.paper.source_id for item in ranked] == ["relevant"]
+
+
+def test_reviewer_matches_acronyms_for_relevance(make_paper) -> None:
+    paper = make_paper(
+        title="DLM Unlearning for Text Generation",
+        summary="We propose an unlearning method for discrete diffusion language models.",
+        source_id="dlm",
+    )
+
+    score = ReviewerAgent().score(paper, query="diffusion language model unlearning")
+
+    assert score.relevance >= 0.8
+
+
+def test_reviewer_treats_llm_unlearning_as_dlm_unlearning_fallback(make_paper) -> None:
+    paper = make_paper(
+        title="Large Language Model Unlearning",
+        summary="We propose an LLM unlearning method with experiments.",
+        source_id="llm-unlearning",
+    )
+
+    score = ReviewerAgent().score(paper, query="diffusion language model unlearning")
+
+    assert score.relevance >= 0.8

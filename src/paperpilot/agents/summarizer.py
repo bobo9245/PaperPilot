@@ -13,22 +13,31 @@ from paperpilot.models import Paper, PaperEvidence, PaperSummary, ReflectionResu
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
-DEFAULT_FACTCHAT_MODEL = "auto"
+DEFAULT_FACTCHAT_MODEL = "cheap"
 FACTCHAT_BASE_URL = "https://factchat-cloud.mindlogic.ai/v1/gateway"
+FACTCHAT_CHEAP_MODEL_PREFERENCES = (
+    "gpt-5.4-nano",
+    "gemini-3.1-flash-lite",
+    "gpt-5-mini",
+    "gemini-3-flash-preview",
+)
 FACTCHAT_MODEL_PREFERENCES = (
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5-20251001",
+    *FACTCHAT_CHEAP_MODEL_PREFERENCES,
+    "gpt-5.4-mini",
+    "gpt-5.3-chat-latest",
+    "gpt-5.2-chat-latest",
+    "gpt-5.1-chat-latest",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
     "gemini-3-pro-preview",
-    "gpt-5.1-chat-latest",
     "gpt-5.1",
-    "gpt-5-mini",
     "gpt-5",
     "accounts/fireworks/models/gpt-oss-120b",
     "grok-3-mini",
     "google/gemma-3-27b-it",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-6",
     "accounts/fireworks/models/llama4-maverick-instruct-basic",
     "accounts/fireworks/models/llama4-scout-instruct-basic",
 )
@@ -195,7 +204,7 @@ class FactChatSummaryBackend:
                     },
                 )
             except Exception as exc:
-                if self.model == "auto" and _is_factchat_model_selection_error(exc):
+                if self.model in {"auto", "cheap"} and _is_factchat_model_selection_error(exc):
                     selection_errors.append(f"{model}: {exc}")
                     continue
                 raise SummaryBackendError(_factchat_request_error(model, exc)) from exc
@@ -220,14 +229,22 @@ class FactChatSummaryBackend:
         )
 
     def _model_candidates(self, client: Any) -> tuple[str, ...]:
-        if self.model != "auto":
+        if self.model not in {"auto", "cheap"}:
             return (self.model,)
 
         model_ids = _factchat_model_ids(client=client, base_url=self.base_url)
         ordered: list[str] = []
-        for model in FACTCHAT_MODEL_PREFERENCES:
+        preferences = FACTCHAT_CHEAP_MODEL_PREFERENCES if self.model == "cheap" else FACTCHAT_MODEL_PREFERENCES
+        for model in preferences:
             if model in model_ids:
                 ordered.append(model)
+        if self.model == "cheap":
+            if not ordered:
+                raise SummaryBackendError(
+                    "FactChat returned no known cheap chat model. Retry with `--summary-model auto` "
+                    "or pass an explicit model from `paperpilot models --provider factchat`."
+                )
+            return tuple(ordered)
         for model in model_ids:
             if model not in ordered:
                 ordered.append(model)
@@ -347,13 +364,19 @@ def build_summary_backend(
     if mode == "heuristic":
         return HeuristicSummaryBackend()
     if mode == "openai":
+        if model == "cheap":
+            raise SummaryBackendError("`--summary-model cheap` is only supported for FactChat summaries")
         resolved_model = model or os.environ.get("PAPERPILOT_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
         return OpenAISummaryBackend(model=resolved_model, detail=detail)
     if mode == "factchat":
         resolved_model = model or os.environ.get("PAPERPILOT_FACTCHAT_MODEL") or DEFAULT_FACTCHAT_MODEL
         return FactChatSummaryBackend(model=resolved_model, detail=detail)
     return AutoSummaryBackend(
-        openai_model=model or os.environ.get("PAPERPILOT_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+        openai_model=(
+            os.environ.get("PAPERPILOT_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+            if model == "cheap"
+            else model or os.environ.get("PAPERPILOT_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+        ),
         factchat_model=model or os.environ.get("PAPERPILOT_FACTCHAT_MODEL") or DEFAULT_FACTCHAT_MODEL,
         detail=detail,
     )
@@ -366,6 +389,14 @@ def list_summary_models(provider: str = "factchat") -> tuple[str, ...]:
         raise SummaryBackendError("Only FactChat model listing is supported.")
     client = _factchat_client(base_url=os.environ.get("PAPERPILOT_FACTCHAT_BASE_URL") or FACTCHAT_BASE_URL)
     return _factchat_model_ids(client=client, base_url=os.environ.get("PAPERPILOT_FACTCHAT_BASE_URL") or FACTCHAT_BASE_URL)
+
+
+def get_summary_credits(provider: str = "factchat") -> dict[str, Any]:
+    """Return the current credit balance for a summary provider."""
+
+    if provider != "factchat":
+        raise SummaryBackendError("Only FactChat credits are supported.")
+    return _factchat_credits_http(base_url=os.environ.get("PAPERPILOT_FACTCHAT_BASE_URL") or FACTCHAT_BASE_URL)
 
 
 def _heuristic_summarize(
@@ -564,6 +595,25 @@ def _factchat_model_ids_http(*, base_url: str) -> tuple[str, ...]:
     return _model_ids_from_response(payload)
 
 
+def _factchat_credits_http(*, base_url: str) -> dict[str, Any]:
+    api_key = _factchat_api_key()
+    if not api_key:
+        raise SummaryBackendError("FACTCHAT_API_KEY is not set")
+    url = f"{base_url.rstrip('/')}/credits/"
+    request = Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise SummaryBackendError(f"FactChat credits request failed with HTTP {exc.code}: {body}") from exc
+    except (OSError, URLError, json.JSONDecodeError) as exc:
+        raise SummaryBackendError(f"FactChat credits request failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SummaryBackendError("FactChat credits response was not a JSON object")
+    return payload
+
+
 def _model_ids_from_response(response: Any) -> tuple[str, ...]:
     data = response.get("data") if isinstance(response, dict) else getattr(response, "data", None)
     if data is None:
@@ -642,6 +692,8 @@ def _openai_instructions(detail: str) -> str:
         "근거에 없는 수치, 데이터셋, 비교 결과, 한계를 만들지 않는다. "
         "확인할 수 없는 항목은 확인 불가 또는 추가 확인 필요라고 명시한다. "
         "문장은 자연스러운 한국어로 쓰고, 영어 원문을 길게 복사하지 않는다. "
+        "보고서에 backend, evidence JSON, JSON 범위 같은 구현 표현을 쓰지 말고 '제공된 근거'라고 표현한다. "
+        "기술 용어는 가능한 한국어로 풀어 쓰고, 꼭 필요한 경우에만 영어를 괄호로 병기한다. "
         f"{depth}"
     )
 
@@ -731,6 +783,7 @@ def _summary_from_llm_data(
     *,
     backend_label: str,
 ) -> PaperSummary:
+    data = _polish_llm_summary_data(data)
     kind = _paper_kind(paper, evidence)
     method_heading = "방법" if kind == "research" else "구성/평가 설계"
     experiment_heading = "실험/결과" if kind == "research" else "벤치마크/결과"
@@ -739,31 +792,30 @@ def _summary_from_llm_data(
     problem = (
         f"한 줄 요약: {data['one_line_summary']}\n\n"
         f"문제: {data['problem']}\n\n"
-        f"근거:\n{_evidence_preview(evidence, 'abstract', 'introduction', 'benchmark')}\n"
+        f"주요 근거:\n{_evidence_preview(evidence, 'problem', 'abstract', 'introduction', 'benchmark')}\n"
         f"{confidence}"
     )
     contribution = (
-        f"핵심 기여와 새로움: {backend_label} 요약 backend가 PDF 근거를 바탕으로 정리한 내용입니다.\n"
         f"새로움/차별점:\n{_plain_bullets(data['novelty'])}\n\n"
         "주요 기여:\n"
         f"{_plain_bullets(data['contributions'])}\n\n"
-        f"근거:\n{_evidence_preview(evidence, 'introduction', 'method', 'benchmark')}"
+        f"주요 근거:\n{_evidence_preview(evidence, 'contribution', 'novelty', 'introduction', 'method', 'benchmark')}"
     )
     method = (
-        f"{method_heading}: {backend_label} 요약 backend가 PDF 근거를 바탕으로 정리한 내용입니다.\n"
+        f"{method_heading}:\n"
         f"{_plain_bullets(data['method_or_design'])}\n\n"
-        f"근거:\n{_evidence_preview(evidence, 'method', 'benchmark', 'introduction')}"
+        f"주요 근거:\n{_evidence_preview(evidence, 'method', 'benchmark', 'introduction')}"
     )
     experiments = (
-        f"{experiment_heading}: {backend_label} 요약 backend가 PDF 근거를 바탕으로 정리한 내용입니다.\n"
+        f"{experiment_heading}:\n"
         f"{_plain_bullets(data['experiments'])}\n\n"
-        f"근거:\n{_evidence_preview(evidence, 'experiments', 'benchmark')}"
+        f"주요 근거:\n{_evidence_preview(evidence, 'experiments', 'benchmark')}"
     )
     limitations = (
-        f"한계와 확인 필요: {backend_label} 요약 backend가 PDF 근거를 바탕으로 정리한 내용입니다.\n"
+        "한계와 확인 필요:\n"
         f"{_plain_bullets(data['limitations'])}\n\n"
         f"근거/검증 메모:\n{_plain_bullets(data['evidence_notes'])}\n"
-        f"근거:\n{_evidence_preview(evidence, 'limitations', 'experiments', 'benchmark')}"
+        f"주요 근거:\n{_evidence_preview(evidence, 'limitations', 'experiments', 'benchmark')}"
     )
     return PaperSummary(
         problem=problem,
@@ -772,6 +824,61 @@ def _summary_from_llm_data(
         experiments=experiments,
         limitations=limitations,
     )
+
+
+def _polish_llm_summary_data(data: dict[str, Any]) -> dict[str, Any]:
+    polished = dict(data)
+    for field in ("one_line_summary", "problem"):
+        polished[field] = _polish_report_language(str(polished[field]))
+    for field in ("novelty", "contributions", "method_or_design", "experiments", "limitations", "evidence_notes"):
+        polished[field] = [_polish_report_language(str(item)) for item in polished[field]]
+    return polished
+
+
+def _polish_report_language(text: str) -> str:
+    replacements = (
+        ("evidence JSON", "제공된 근거"),
+        ("JSON 범위", "제공된 근거 범위"),
+        ("evidence 범위", "제공된 근거 범위"),
+        ("evidence만으로는", "제공된 근거만으로는"),
+        ("evidence에", "제공된 근거에서"),
+        ("evidence", "근거"),
+        ("backend", "요약 과정"),
+        ("document structure-aware", "문서 구조 인식"),
+        ("layout-aware", "레이아웃 인식"),
+        ("holistic page-level", "페이지 전체 단위"),
+        ("page-level", "페이지 단위"),
+        ("LLM-driven", "LLM 기반"),
+        ("artifact transformation", "문서 변환"),
+        ("placeholder", "자리표시자"),
+        ("positional alignment", "위치 정렬"),
+        ("retrieval representations", "검색용 표현"),
+        ("retrieval 표현", "검색용 표현"),
+        ("generation context", "생성용 문맥"),
+        ("generation 컨텍스트", "생성용 문맥"),
+        ("inference-time", "추론 시점"),
+        ("inference", "추론"),
+        ("ingestion", "수집/전처리"),
+        ("split", "분할"),
+        ("decouple", "분리"),
+        ("grounding된", "근거가 연결된"),
+        ("grounded", "근거가 연결된"),
+        ("vision-centric", "비전 중심"),
+        ("baseline", "비교 기준"),
+        ("out-of-box", "별도 학습 없이"),
+        ("encoder", "인코더"),
+        ("query re-writer", "질의 재작성기"),
+        ("list-wise LLM reranker", "목록 단위 LLM 재랭커"),
+        ("MM answer generator", "멀티모달 답변 생성기"),
+        ("fine-grained generative recall", "세밀한 생성 회상률"),
+        ("LLM Judge", "LLM 평가자"),
+        ("single call", "단일 호출"),
+    )
+    polished = text
+    for source, target in replacements:
+        polished = polished.replace(source, target)
+    polished = re.sub(r"\s+", " ", polished).strip()
+    return polished
 
 
 def validate_summary(summary: PaperSummary) -> ReflectionResult:
@@ -936,7 +1043,7 @@ def _method_sentence(paper: Paper, evidence: PaperEvidence | None = None) -> str
         if sentences:
             heading = "방법" if kind == "research" else "구성/평가 설계"
             focus = (
-                "입력 처리, 검색/생성 파이프라인, 모델 구성 요소가 어떻게 분리되는지 본문 근거 중심으로 추적했습니다."
+                "입력 처리, 모델 구성, 학습/평가 절차가 어떻게 나뉘는지 본문 근거 중심으로 추적했습니다."
                 if kind == "research"
                 else "태스크 구성, 데이터셋, 평가 프로토콜, 참가 시스템 경향을 중심으로 추적했습니다."
             )
@@ -1213,6 +1320,35 @@ def _evidence_preview(evidence: PaperEvidence | None, *labels: str) -> str:
 
 def _preview_keywords(labels: tuple[str, ...]) -> tuple[str, ...]:
     label_set = set(labels)
+    if "problem" in label_set:
+        return (
+            "problem",
+            "challenge",
+            "motivation",
+            "however",
+            "need",
+            "requires",
+            "lack",
+            "fall short",
+            "limitation",
+            "difficult",
+        )
+    if "contribution" in label_set or "novelty" in label_set:
+        return (
+            "contribution",
+            "contributions",
+            "novel",
+            "new",
+            "first",
+            "unlike",
+            "whereas",
+            "instead",
+            "we propose",
+            "we introduce",
+            "we present",
+            "our approach",
+            "outperform",
+        )
     if "experiments" in label_set:
         return (
             "experiment",
@@ -1290,10 +1426,10 @@ def _interpret_sentence(sentence: str, *, kind: str) -> str:
     if kind == "problem":
         if any(token in text for token in ("we propose", "we introduce", "framework", "system")):
             return "본문은 이 문제를 해결하기 위한 시스템/프레임워크 제안으로 논의를 이어갑니다."
-        if any(token in text for token in ("layout", "structure", "table", "chart", "visually-rich")):
-            return "기존 RAG/검색 방식은 문서의 레이아웃, 표, 그림 같은 구조 정보를 충분히 다루지 못하는 문제가 있습니다."
-        if any(token in text for token in ("challenge", "participant", "task")):
-            return "논문은 여러 태스크나 참가 시스템을 통해 멀티모달 검색 문제를 평가해야 한다고 봅니다."
+        if _has_any_keyword(sentence, ("layout", "structure", "table", "chart", "visually-rich")):
+            return "기존 텍스트 중심 접근은 문서의 레이아웃, 표, 그림 같은 구조 정보를 충분히 다루지 못하는 문제가 있습니다."
+        if _has_any_keyword(sentence, ("challenge", "participant", "task")):
+            return "논문은 여러 태스크나 참가 시스템을 통해 문제를 체계적으로 평가해야 한다고 봅니다."
         return "기존 접근의 한계나 문제 설정을 본문에서 명시적으로 제기합니다."
 
     if kind == "contribution":
@@ -1302,25 +1438,25 @@ def _interpret_sentence(sentence: str, *, kind: str) -> str:
         if any(token in text for token in ("we propose", "we introduce", "framework", "system")):
             name = _preferred_entity(entities)
             target = f"{name}를 중심으로 " if name else ""
-            return f"{target}새로운 시스템/프레임워크를 제안하는 것이 핵심 기여입니다."
+            return f"{target}새로운 방법, 벤치마크, 또는 프레임워크를 제안하는 것이 핵심 기여입니다."
         if "variant" in text:
             return "여러 설계 변형을 통제 비교해 어떤 구성 요소가 성능에 기여하는지 분리해 보려 합니다."
         return "본문에서 제안점이나 기여 항목으로 표시된 내용을 핵심 기여로 봅니다."
 
     if kind == "method":
         if any(token in text for token in ("pipeline", "ingestion", "chunk", "split")):
-            return "문서 구조에 따라 parsing, chunking, ingestion 경로를 달리하는 파이프라인을 사용합니다."
+            return "입력 자료를 단계별로 나누고 처리 경로를 분리하는 파이프라인을 사용합니다."
         if any(token in text for token in ("rerank", "generator", "query re-writer", "assembly")):
             return "query rewriting, reranking, answer generation 같은 RAG 구성 요소를 분리해 조합합니다."
-        if any(token in text for token in ("layout", "artifact", "placeholder")):
-            return "레이아웃과 시각적 artifact를 보존해 retrieval 표현과 generation context를 다르게 구성합니다."
+        if _has_any_keyword(sentence, ("layout", "artifact", "placeholder")):
+            return "레이아웃과 시각적 단서를 보존해 모델 입력과 표현 구성을 다르게 만듭니다."
         return "본문에서 설명한 접근 방식과 시스템 구성 요소를 방법 단서로 사용합니다."
 
     if kind == "benchmark_method":
         if any(token in text for token in ("task", "track")):
             return "벤치마크는 복수의 검색 태스크를 하나의 시스템으로 풀도록 설계되어 있습니다."
         if any(token in text for token in ("dataset", "page", "screenshot", "ocr")):
-            return "평가 데이터는 페이지 이미지, OCR 텍스트, 설명 등 멀티모달 입력을 포함합니다."
+            return "평가 데이터는 과제 성격에 맞는 입력, 라벨, 또는 보조 정보를 포함합니다."
         if any(token in text for token in ("leaderboard", "score", "recall")):
             return "평가는 leaderboard 점수와 recall 계열 지표를 중심으로 집계됩니다."
         return "태스크, 데이터셋, 평가 프로토콜을 중심으로 벤치마크 구성을 설명합니다."
@@ -1347,6 +1483,10 @@ def _interpret_sentence(sentence: str, *, kind: str) -> str:
         return "본문의 논의 문장을 근거로 한계와 추가 확인 지점을 정리합니다."
 
     return _trim_sentence(sentence, max_chars=160)
+
+
+def _has_any_keyword(sentence: str, keywords: tuple[str, ...]) -> bool:
+    return any(_contains_keyword(sentence, keyword) for keyword in keywords)
 
 
 def _named_entities(sentence: str) -> list[str]:
@@ -1408,9 +1548,18 @@ def _paper_kind(paper: Paper, evidence: PaperEvidence | None = None) -> str:
 def _one_line_summary(paper: Paper, evidence: PaperEvidence | None = None) -> str:
     kind = _paper_kind(paper, evidence)
     title = paper.title
+    text = f"{paper.title} {paper.summary}".lower()
     if kind == "benchmark":
-        return f"{title}는 멀티모달 문서 검색/RAG 평가를 위한 벤치마크·챌린지 보고서입니다."
-    if "rag" in title.lower() or "retrieval" in title.lower():
+        if any(token in text for token in ("unlearning", "forget", "retention")):
+            return f"{title}는 모델 언러닝과 보존 성능을 함께 평가하기 위한 벤치마크 논문입니다."
+        if any(token in text for token in ("clinical", "disease", "patient")):
+            return f"{title}는 임상 질병 추론 환경에서 모델 평가를 체계화하려는 벤치마크 논문입니다."
+        if any(token in text for token in ("rag", "retrieval", "multimodal", "document")):
+            return f"{title}는 문서 검색/RAG 평가를 위한 벤치마크·챌린지 보고서입니다."
+        return f"{title}는 특정 연구 문제를 반복 가능하게 평가하기 위한 벤치마크·챌린지 보고서입니다."
+    if any(token in text for token in ("unlearning", "forget", "retention")):
+        return f"{title}는 모델 언러닝에서 무엇을 지우고 무엇을 유지해야 하는지 평가하는 연구입니다."
+    if "rag" in text or "retrieval" in text:
         return f"{title}는 검색 증강 생성에서 문서 구조와 검색/생성 파이프라인을 개선하려는 시스템 논문입니다."
     return f"{title}는 초록과 PDF 본문 근거를 바탕으로 선별된 관련 연구입니다."
 
@@ -1418,4 +1567,4 @@ def _one_line_summary(paper: Paper, evidence: PaperEvidence | None = None) -> st
 def _contribution_judgment(paper: Paper, evidence: PaperEvidence | None = None) -> str:
     if _paper_kind(paper, evidence) == "benchmark":
         return "새 모델 제안 여부보다 태스크 정의, 평가 프로토콜, 참가 시스템 분석이 핵심 기여인지 확인했습니다."
-    return "초록의 주장만 반복하지 않고, 본문에서 확인되는 시스템/프레임워크 수준의 차별점을 우선 기록했습니다."
+    return "초록의 주장만 반복하지 않고, 본문에서 확인되는 방법, 평가 설계, 또는 시스템 수준의 차별점을 우선 기록했습니다."
